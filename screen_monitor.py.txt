@@ -1,0 +1,342 @@
+import time
+import os
+import threading
+import mss
+from pynput import mouse
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog, messagebox, font
+import json # Added for settings persistence
+
+# The core application class using Tkinter for the GUI
+class ScreenshotApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Productivity Monitor")
+        master.resizable(False, False)
+        
+        # --- CONFIGURATION VARIABLES (Managed by GUI) ---
+        self.interval_var = tk.StringVar(value="30") # Screenshot interval in seconds
+        self.screenshot_interval = 30  
+        
+        self.timeout_var = tk.StringVar(value="10") # Inactivity timeout in minutes (User Input)
+        self.inactivity_timeout = 600    # Actual timeout in seconds (10 minutes)
+        
+        # Default directory (C:\Users\<user>\Screen_Captures)
+        self.save_directory = os.path.join(os.path.expanduser("~"), "Screen_Captures")
+        self.SETTINGS_FILE = "monitor_settings.json" # File to store settings
+        
+        # Load settings immediately to set initial values
+        self.load_settings() 
+        
+        # --- GLOBAL STATE ---
+        self.is_capture_running = False 
+        self.last_activity_time = time.time()
+        self.capture_thread = None
+        self.mouse_listener = None
+
+        # Set up custom fonts
+        self.title_font = font.Font(family="Helvetica", size=16, weight="bold")
+        self.status_font = font.Font(family="Helvetica", size=12, weight="bold")
+
+        # Set up GUI elements
+        self.setup_ui()
+        self.initialize_directory()
+        self.start_mouse_listener()
+        
+        # Clean up and save settings on window close
+        master.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def load_settings(self):
+        """Loads settings from JSON file."""
+        try:
+            with open(self.SETTINGS_FILE, 'r') as f:
+                settings = json.load(f)
+                
+                # Load Interval
+                interval = str(settings.get('interval', 30))
+                self.interval_var.set(interval)
+                self.screenshot_interval = int(interval)
+                
+                # Load Timeout
+                timeout = str(settings.get('timeout_minutes', 10))
+                self.timeout_var.set(timeout)
+                self.inactivity_timeout = int(timeout) * 60
+
+                # Load Directory
+                saved_dir = settings.get('save_directory', self.save_directory)
+                # Check if the loaded directory is valid before using it
+                if os.path.isdir(saved_dir) or not os.path.exists(saved_dir):
+                     self.save_directory = saved_dir
+                
+                print("Settings loaded successfully.")
+
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("No settings file found or file corrupted. Using default settings.")
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+
+    def save_settings(self):
+        """Saves current settings to JSON file."""
+        settings = {
+            'interval': self.screenshot_interval,
+            'timeout_minutes': int(self.inactivity_timeout / 60),
+            'save_directory': self.save_directory
+        }
+        try:
+            with open(self.SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=4)
+            print("Settings saved.")
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+
+    def setup_ui(self):
+        # Title
+        tk.Label(self.master, text="Screen Capture Monitor", font=self.title_font, pady=10).pack()
+        # 
+
+        # Status Display
+        self.status_var = tk.StringVar(value="Status: Waiting for 'Start'")
+        self.status_label = tk.Label(self.master, textvariable=self.status_var, 
+                                     fg="gray", font=self.status_font, pady=5)
+        self.status_label.pack()
+
+        # Directory Selector
+        dir_frame = tk.Frame(self.master, padx=10, pady=5)
+        dir_frame.pack(fill='x')
+        
+        tk.Label(dir_frame, text="Save Folder:", width=10, anchor='w').pack(side='left')
+        self.dir_var = tk.StringVar(value=self.save_directory)
+        self.dir_label = tk.Label(dir_frame, textvariable=self.dir_var, bg='white', relief='sunken', width=30, anchor='w')
+        self.dir_label.pack(side='left', padx=5)
+        
+        tk.Button(dir_frame, text="Browse", command=self.select_directory).pack(side='right')
+
+        # Interval Input & Timeout Display
+        interval_frame = tk.Frame(self.master, padx=10, pady=5)
+        interval_frame.pack(fill='x')
+
+        # Screenshot Interval Input
+        tk.Label(interval_frame, text="Interval (seconds):", anchor='w').pack(side='left')
+        
+        self.interval_spinbox = tk.Spinbox(interval_frame, from_=5, to_=3600, 
+                                           textvariable=self.interval_var, 
+                                           width=5)
+        self.interval_spinbox.pack(side='left', padx=5)
+        self.interval_spinbox.bind('<FocusOut>', lambda e: self.update_interval_settings())
+        
+        # Inactivity Timeout Input (New)
+        tk.Label(interval_frame, text="Timeout (minutes):", anchor='w').pack(side='left', padx=(20, 0))
+
+        self.timeout_spinbox = tk.Spinbox(interval_frame, from_=1, to_=600,
+                                          textvariable=self.timeout_var,
+                                          width=5)
+        self.timeout_spinbox.pack(side='left', padx=5)
+        self.timeout_spinbox.bind('<FocusOut>', lambda e: self.update_timeout_settings())
+
+
+        # Control Button
+        self.control_button = tk.Button(self.master, text="Start Monitoring", 
+                                        command=self.toggle_monitoring, 
+                                        bg="green", fg="white", 
+                                        font=self.status_font, padx=20, pady=10)
+        self.control_button.pack(pady=20)
+        
+
+    def select_directory(self):
+        """Allows the user to select a custom save directory."""
+        if self.is_capture_running:
+            messagebox.showwarning("Warning", "Cannot change directory while monitoring is running.")
+            return
+
+        new_dir = filedialog.askdirectory(initialdir=self.save_directory)
+        if new_dir:
+            self.save_directory = new_dir
+            self.dir_var.set(self.save_directory)
+            self.initialize_directory()
+            self.save_settings() # Save updated directory
+
+    def update_interval_settings(self):
+        """Validates and updates the screenshot interval from the input field."""
+        if self.is_capture_running:
+            return
+
+        try:
+            # Safely read and convert the input to an integer
+            new_interval = int(self.interval_var.get())
+            if new_interval < 5:
+                # Minimum interval to prevent system overload
+                raise ValueError("Interval must be 5 seconds or more.") 
+            
+            self.screenshot_interval = new_interval
+            self.interval_var.set(str(new_interval))
+            self.save_settings() # Save updated interval
+            print(f"Interval updated to {new_interval} seconds.")
+            
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", "Please enter a valid number (integer) for the interval (minimum 5 seconds).")
+            self.interval_var.set(str(self.screenshot_interval)) # Revert to last valid setting
+
+    def update_timeout_settings(self):
+        """Validates and updates the inactivity timeout from the input field."""
+        if self.is_capture_running:
+            return
+
+        try:
+            # Read input as minutes
+            new_timeout_minutes = int(self.timeout_var.get())
+            if new_timeout_minutes < 1:
+                raise ValueError("Timeout must be 1 minute or more.") 
+            
+            # Convert to seconds for the capture loop
+            self.inactivity_timeout = new_timeout_minutes * 60
+            self.timeout_var.set(str(new_timeout_minutes))
+            self.save_settings() # Save updated timeout
+            print(f"Inactivity timeout updated to {new_timeout_minutes} minutes ({self.inactivity_timeout} seconds).")
+            
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", "Please enter a valid number (integer) for the timeout (minimum 1 minute).")
+            # Revert to last valid setting, converted back to minutes
+            self.timeout_var.set(str(int(self.inactivity_timeout / 60)))
+
+
+    def initialize_directory(self):
+        """Checks if the save directory exists and creates it if necessary."""
+        try:
+            if not os.path.exists(self.save_directory):
+                os.makedirs(self.save_directory)
+                print(f"Created directory: {self.save_directory}")
+        except OSError as e:
+            messagebox.showerror("Directory Error", f"Error creating directory {self.save_directory}: {e}")
+            self.master.destroy() # Exit if fatal error
+
+    def capture_screenshot(self):
+        """Captures a screenshot of all monitors and saves it."""
+        try:
+            with mss.mss() as sct:
+                # Get all monitor screens combined (monitor 0)
+                monitor = sct.monitors[0] 
+                sct_img = sct.grab(monitor)
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = os.path.join(self.save_directory, f"screenshot_{timestamp}.png")
+                
+                # Save the image using mss tools
+                mss.tools.to_png(sct_img.rgb, sct_img.size, output=filename)
+                
+                print(f"Captured and saved: {filename}")
+                
+        except Exception as e:
+            print(f"Error during screenshot capture: {e}")
+            # Do not stop the app, just log the error
+
+    def main_capture_loop(self):
+        """Runs in a separate thread. Takes screenshots and checks for timeout."""
+        
+        print("Capture loop started.")
+
+        while self.is_capture_running:
+            current_time = time.time()
+            
+            # Check for inactivity timeout
+            if current_time - self.last_activity_time > self.inactivity_timeout:
+                self.stop_monitoring(reason="TIMEOUT")
+                break
+            
+            # Take screenshot
+            self.capture_screenshot()
+            
+            # Wait for the next interval (uses the updated value)
+            time.sleep(self.screenshot_interval)
+            
+        print("Capture loop finished.")
+
+    # --- MOUSE MONITORING HANDLERS ---
+    def on_move(self, x, y):
+        """Updates the last activity time on mouse movement."""
+        self.last_activity_time = time.time()
+        
+    def on_click(self, x, y, button, pressed):
+        """Updates the last activity time on mouse click."""
+        if pressed:
+            self.last_activity_time = time.time()
+
+    def start_mouse_listener(self):
+        """Starts the mouse listener thread (runs continuously)."""
+        if not self.mouse_listener or not self.mouse_listener.is_alive():
+            self.mouse_listener = mouse.Listener(
+                on_click=self.on_click, 
+                on_move=self.on_move
+            )
+            self.mouse_listener.daemon = True # Allows the main app to close cleanly
+            self.mouse_listener.start()
+            print("Mouse listener started.")
+
+
+    # --- CONTROL LOGIC ---
+    def toggle_monitoring(self):
+        """Starts or stops the screenshot process based on current state."""
+        if not self.is_capture_running:
+            self.start_monitoring()
+        else:
+            self.stop_monitoring(reason="MANUAL")
+
+    def start_monitoring(self):
+        """Starts the main screenshot thread."""
+        if not self.is_capture_running:
+            # Ensure we use the latest interval and timeout set by the user
+            self.update_interval_settings() 
+            self.update_timeout_settings() 
+
+            self.is_capture_running = True
+            self.last_activity_time = time.time() # Reset timer on start
+            
+            # Start the capture loop in a background thread
+            self.capture_thread = threading.Thread(target=self.main_capture_loop)
+            self.capture_thread.daemon = True
+            self.capture_thread.start()
+            
+            # Update GUI
+            self.status_var.set("Status: RUNNING...")
+            self.status_label.config(fg="red")
+            self.control_button.config(text="Stop Monitoring", bg="red")
+            print("Monitoring started.")
+
+    def stop_monitoring(self, reason="MANUAL"):
+        """Stops the main screenshot thread."""
+        if self.is_capture_running:
+            self.is_capture_running = False
+            
+            # Wait briefly for the capture thread to finish its current sleep/capture cycle
+            if self.capture_thread and self.capture_thread.is_alive():
+                # Note: We rely on the while loop condition in main_capture_loop.
+                pass 
+                
+            # Update GUI
+            if reason == "TIMEOUT":
+                 timeout_minutes = int(self.inactivity_timeout / 60)
+                 self.status_var.set(f"Status: STOPPED ({timeout_minutes} min Inactivity Timeout)")
+            else:
+                 self.status_var.set("Status: Stopped (Manual)")
+
+            self.status_label.config(fg="green")
+            self.control_button.config(text="Start Monitoring", bg="green")
+            print(f"Monitoring stopped. Reason: {reason}")
+
+
+    def on_closing(self):
+        """Handles graceful shutdown when the window is closed."""
+        self.save_settings() # Save settings before closing
+        self.stop_monitoring(reason="WINDOW_CLOSED")
+        if self.mouse_listener and self.mouse_listener.is_alive():
+             # Stop the mouse listener explicitly
+             self.mouse_listener.stop() 
+        self.master.destroy()
+
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ScreenshotApp(root)
+    # MINIMIZE THE WINDOW WHEN THE APP STARTS
+    root.iconify() 
+    root.mainloop()
